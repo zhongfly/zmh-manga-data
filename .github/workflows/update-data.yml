@@ -36,11 +36,31 @@ jobs:
           gh release download data --repo "$GITHUB_REPOSITORY" --pattern 'zaimanhua.sqlite3' --dir data
           test -f data/zaimanhua.sqlite3
 
+      - name: Record DB hash
+        id: db_hash
+        run: |
+          echo "before=$(sha256sum data/zaimanhua.sqlite3 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
       - name: Run updater
         run: |
           python main.py --db data/zaimanhua.sqlite3
 
+      - name: Check if DB changed
+        id: db_changed
+        run: |
+          before="${{ steps.db_hash.outputs.before }}"
+          after="$(sha256sum data/zaimanhua.sqlite3 | cut -d' ' -f1)"
+          echo "after=$after" >> "$GITHUB_OUTPUT"
+          if [ "$before" = "$after" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "DB unchanged; skip release upload."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "DB changed; will upload to release."
+          fi
+
       - name: Upload DB to release tag "data"
+        if: steps.db_changed.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
