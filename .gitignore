@@ -15,3 +15,4 @@ data/
 
 # Tests
 tests/
+.ace-tool/
