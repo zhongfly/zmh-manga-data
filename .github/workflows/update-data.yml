@@ -1,0 +1,47 @@
+name: update
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-data-release
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests
+
+      - name: Download DB from release tag "data"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p data
+          gh release download data --repo "$GITHUB_REPOSITORY" --pattern 'zaimanhua.sqlite3' --dir data
+          test -f data/zaimanhua.sqlite3
+
+      - name: Run updater
+        run: |
+          python main.py --db data/zaimanhua.sqlite3
+
+      - name: Upload DB to release tag "data"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload data data/zaimanhua.sqlite3 --repo "$GITHUB_REPOSITORY" --clobber
