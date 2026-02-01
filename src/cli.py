@@ -6,6 +6,7 @@ import threading
 import random
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,7 @@ class SyncConfig:
     commit_every: int
     start_id: int | None
     clean_existing: bool
+    update_history: bool
     aliases_workers: int
     detail_workers: int
 
@@ -43,22 +45,31 @@ def main(argv: list[str] | None = None) -> int:
     cfg = _parse_args(argv)
     store = SqliteStore(cfg.db_path)
     try:
-        if cfg.start_id is not None:
+        if cfg.start_id is not None and not cfg.update_history:
             store.set_next_id(cfg.start_id)
             store.commit()
 
         if cfg.clean_existing:
             _maybe_clean_existing_data(store)
 
-        with (
-            _AliasPool(cfg.aliases_workers, timeout_seconds=cfg.timeout_seconds) as alias_pool,
-            _DetailPool(
-                cfg.detail_workers,
-                base_url=cfg.base_url,
-                api_version=cfg.api_version,
-                timeout_seconds=cfg.timeout_seconds,
-            ) as detail_pool,
-        ):
+        with ExitStack() as stack:
+            alias_pool: _AliasPool | None = None
+            if not cfg.update_history:
+                alias_pool = stack.enter_context(
+                    _AliasPool(cfg.aliases_workers, timeout_seconds=cfg.timeout_seconds)
+                )
+            detail_pool = stack.enter_context(
+                _DetailPool(
+                    cfg.detail_workers,
+                    base_url=cfg.base_url,
+                    api_version=cfg.api_version,
+                    timeout_seconds=cfg.timeout_seconds,
+                )
+            )
+            if cfg.update_history:
+                return _update_history_data(store, detail_pool=detail_pool, cfg=cfg)
+
+            assert alias_pool is not None
             checkpoint_next_id = store.get_next_id()
             next_request_id = checkpoint_next_id
             consecutive_error_count = 0
@@ -256,11 +267,21 @@ def _parse_args(argv: list[str] | None) -> SyncConfig:
     parser.add_argument("--max-errors", type=int, default=5, help="连续错误次数达到后停止")
     parser.add_argument("--max-zero-streak", type=int, default=20, help="连续命中 data.id=0 达到后停止")
     parser.add_argument("--commit-every", type=int, default=100, help="每 N 条成功记录提交一次")
-    parser.add_argument("--start-id", type=int, default=None, help="覆盖断点，从指定 id 开始")
+    parser.add_argument(
+        "--start-id",
+        type=int,
+        default=None,
+        help="覆盖断点（抓取模式）/历史更新起点（--update-history），从指定 id 开始",
+    )
     parser.add_argument(
         "--clean-existing",
         action="store_true",
         help="启动时清洗历史数据（默认禁用，仅在清洗版本变更时生效一次）",
+    )
+    parser.add_argument(
+        "--update-history",
+        action="store_true",
+        help="更新 comics 表中已有历史数据（不抓取别名，保留原有 aliases 字段）",
     )
     parser.add_argument(
         "--aliases-workers",
@@ -304,6 +325,7 @@ def _parse_args(argv: list[str] | None) -> SyncConfig:
         commit_every=args.commit_every,
         start_id=args.start_id,
         clean_existing=bool(args.clean_existing),
+        update_history=bool(args.update_history),
         aliases_workers=args.aliases_workers,
         detail_workers=args.detail_workers,
     )
@@ -412,6 +434,138 @@ def _maybe_clean_existing_data(store: SqliteStore) -> None:
     store.set_meta("clean_version", str(CLEAN_VERSION))
     store.commit()
     _print_line(f"[CLEAN] 完成：扫描 {total} 条，更新 {updated} 条。")
+
+
+def _update_history_data(store: SqliteStore, *, detail_pool: "_DetailPool", cfg: SyncConfig) -> int:
+    targets: list[tuple[int, bool, object]] = []
+    for comic_id, json_text in store.iter_comics():
+        if cfg.start_id is not None and comic_id < cfg.start_id:
+            continue
+        try:
+            existing = json.loads(json_text)
+        except json.JSONDecodeError as exc:
+            store.add_error(
+                ErrorRecord(
+                    comic_id=comic_id,
+                    occurred_at=_utc_now_iso(),
+                    error=f"历史更新：本地数据 JSON 解析失败: {exc}",
+                    status_code=None,
+                    response_text=_truncate_text(json_text),
+                )
+            )
+            store.commit()
+            targets.append((comic_id, False, None))
+            continue
+
+        if isinstance(existing, dict) and "aliases" in existing:
+            targets.append((comic_id, True, existing["aliases"]))
+        else:
+            targets.append((comic_id, False, None))
+
+    if not targets:
+        if cfg.start_id is not None:
+            _print_line(f"[HIST] 未找到 id>={cfg.start_id} 的历史数据，无需更新。")
+        else:
+            _print_line("[HIST] comics 表为空，无需更新。")
+        return 0
+
+    total = len(targets)
+    start_hint = f"，起始 id={cfg.start_id}" if cfg.start_id is not None else ""
+    _print_line(f"[HIST] 开始更新历史数据：{total} 条（不更新 aliases{start_hint}）")
+
+    consecutive_error_count = 0
+    detail_futures: dict[int, Future[object]] = {}
+    next_detail_prefetch_index = 0
+
+    def prefetch_details() -> None:
+        nonlocal next_detail_prefetch_index
+        while len(detail_futures) < cfg.detail_workers and next_detail_prefetch_index < total:
+            cid = targets[next_detail_prefetch_index][0]
+            if cid not in detail_futures:
+                detail_futures[cid] = detail_pool.submit(cid)
+            next_detail_prefetch_index += 1
+
+    for i, (comic_id, has_aliases, existing_aliases) in enumerate(targets, start=1):
+        prefetch_details()
+
+        detail_future = detail_futures.pop(comic_id, None)
+        if detail_future is None:
+            detail_future = detail_pool.submit(comic_id)
+
+        try:
+            result = detail_future.result()
+        except FetchError as exc:
+            consecutive_error_count += 1
+            store.add_error(
+                ErrorRecord(
+                    comic_id=comic_id,
+                    occurred_at=_utc_now_iso(),
+                    error=str(exc),
+                    status_code=exc.status_code,
+                    response_text=exc.response_text,
+                )
+            )
+            store.commit()
+            _print_line(f"[HIST-ERROR] id={comic_id} {exc} ({consecutive_error_count}/{cfg.max_errors})")
+            if consecutive_error_count >= cfg.max_errors:
+                _print_line("[STOP] 连续错误次数达到上限，已停止。")
+                return 2
+            _sleep_after_error(consecutive_error_count, cfg.delay_seconds)
+            continue
+
+        detail_id = _as_int(result.detail.get("id"))
+        if detail_id == 0:
+            consecutive_error_count = 0
+            store.add_error(
+                ErrorRecord(
+                    comic_id=comic_id,
+                    occurred_at=_utc_now_iso(),
+                    error="历史更新：data.id=0，已跳过更新",
+                    status_code=None,
+                    response_text=_truncate_text(
+                        json.dumps(result.detail, ensure_ascii=False, separators=(",", ":"))
+                    ),
+                )
+            )
+            store.commit()
+            _print_line(f"[HIST-SKIP] id={comic_id} data.id=0，已跳过更新 ({i}/{total})")
+            _sleep_between_requests(cfg.delay_seconds)
+            continue
+
+        cleaned_detail = clean_detail(result.detail)
+        title = cleaned_detail.get("title")
+        if not isinstance(title, str) or not title.strip():
+            consecutive_error_count = 0
+            store.add_error(
+                ErrorRecord(
+                    comic_id=comic_id,
+                    occurred_at=_utc_now_iso(),
+                    error="历史更新：数据 title 为空，已跳过更新",
+                    status_code=None,
+                    response_text=_truncate_text(
+                        json.dumps(cleaned_detail, ensure_ascii=False, separators=(",", ":"))
+                    ),
+                )
+            )
+            store.commit()
+            _print_line(f"[HIST-SKIP] id={comic_id} title 为空，已跳过更新 ({i}/{total})")
+            _sleep_between_requests(cfg.delay_seconds)
+            continue
+
+        consecutive_error_count = 0
+        if has_aliases:
+            cleaned_detail["aliases"] = existing_aliases
+        else:
+            cleaned_detail.pop("aliases", None)
+
+        store.upsert_comic(comic_id, cleaned_detail)
+        store.commit()
+
+        _print_line(f"[HIST-OK] id={comic_id} ({i}/{total})")
+        _sleep_between_requests(cfg.delay_seconds)
+
+    _print_line(f"[HIST] 完成：更新 {total} 条。")
+    return 0
 
 
 def _truncate_text(text: str, limit: int = 20_000) -> str:

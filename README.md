@@ -11,6 +11,7 @@
 `hot_num`、`hit_num`、`uid`、`subscribe_num`、`corner_mark`、`status`、`comicNotice`、`authorNotice`。
 
 如需清洗历史数据（可选）：使用 `--clean-existing` 触发（同一清洗版本只会执行一次）。
+如需更新历史数据但不更新别名（可选）：使用 `--update-history` 触发（只更新 comics 表中已有记录的详情，保留原有 `aliases`；可搭配 `--start-id` 指定起始 id）。
 
 ### 随机休息
 
@@ -52,4 +53,3 @@ uv run python main.py --help
 
 SQLite 允许多进程并发读，但同一时刻只能有一个写入者；当你同时运行多个实例时会产生写入竞争。
 程序已设置 `busy_timeout=60s`，遇到锁会等待而不是立刻报 `database is locked`。
-
