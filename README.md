@@ -11,7 +11,17 @@
 `hot_num`、`hit_num`、`uid`、`subscribe_num`、`corner_mark`、`status`、`comicNotice`、`authorNotice`。
 
 如需清洗历史数据（可选）：使用 `--clean-existing` 触发（同一清洗版本只会执行一次）。
-如需更新历史数据但不更新别名（可选）：使用 `--update-history` 触发（只更新 comics 表中已有记录的详情，保留原有 `aliases`；可搭配 `--start-id` 指定起始 id）。
+默认启动会进行：
+- 数据库维护：清理 `errors` 表中早于 30 天的记录，并执行 SQLite 优化/压缩（可用 `--no-db-maintenance` 关闭）。
+- 自动更新历史数据：每次运行会先更新本地 `comics` 表中的一批记录（默认 1000 条，包含 `aliases`；可用 `--no-auto-update-history` 关闭）。
+  - 批量大小：`--history-batch-size`（默认 1000；设为 `0` 表示从起点更新到最后一个 id）。
+  - 起点：默认从 `meta.history_next_id` 继续；也可用 `--start-id` 覆盖本次起点。
+  - 若连续错误达到 `--max-errors`：结束自动历史更新并休息 1 分钟，然后继续进入正常抓取。
+
+手动更新模式（执行后退出，可搭配 `--start-id` 指定起始 id）：
+- `--update-details`：仅更新详情（保留原有 `aliases`）
+- `--update-all`：更新详情 + 更新 `aliases`
+- `--update-aliases`：仅更新 `aliases`（不更新详情）
 
 ### 随机休息
 
@@ -19,8 +29,8 @@
 
 ### 并发抓取
 
-- `--aliases-workers`：aliases 并发抓取线程数（默认 1）
-- `--detail-workers`：详情接口并发抓取线程数（默认 1，独立设置）
+- `--aliases-workers`：aliases 并发抓取线程数（默认 2）
+- `--detail-workers`：详情接口并发抓取线程数（默认 2，独立设置）
 
 例如：
 
@@ -45,7 +55,7 @@ uv run python main.py --help
 断点续跑：`meta` 表中的 `next_id`（最后一次成功抓取的下一个 id）  
 停止条件：
 - 连续错误达到 `--max-errors`（默认 5，重试使用指数退让）
-- 连续 `--max-zero-streak` 次命中 `data.id=0`（默认 10）  
+- 连续 `--max-zero-streak` 次命中 `data.id=0`（默认 20）  
 - 若 `data.id!=0` 但 `title` 为空：跳过保存并记录到 `errors`（不计入连续错误）  
 错误记录：`errors` 表（包含错误原因与返回文本）
 

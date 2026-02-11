@@ -5,7 +5,7 @@ import sqlite3
 import time
 import random
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -51,6 +51,24 @@ class SqliteStore:
                 self._conn.close()
             finally:
                 self._cleanup_wal_shm_files_best_effort()
+
+    def purge_errors_older_than_days(self, retention_days: int) -> int:
+        if retention_days < 0:
+            retention_days = 0
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        cutoff_iso = cutoff.replace(microsecond=0).isoformat()
+        cursor = self._conn.execute(
+            "DELETE FROM errors WHERE occurred_at < ?",
+            (cutoff_iso,),
+        )
+        deleted = int(cursor.rowcount or 0)
+        return max(deleted, 0)
+
+    def pragma_optimize_best_effort(self) -> None:
+        self._execute_best_effort("PRAGMA optimize;")
+
+    def vacuum_best_effort(self) -> None:
+        self._execute_best_effort("VACUUM;")
 
     def _init_schema(self) -> None:
         self._conn.executescript(
@@ -143,11 +161,42 @@ class SqliteStore:
         for row in cursor:
             yield int(row[0]), str(row[1])
 
+    def iter_comics_from_id(self, start_id: int, *, limit: int | None = None) -> Iterable[tuple[int, str]]:
+        if limit is None:
+            cursor = self._conn.execute(
+                "SELECT id, json FROM comics WHERE id >= ? ORDER BY id",
+                (start_id,),
+            )
+        else:
+            cursor = self._conn.execute(
+                "SELECT id, json FROM comics WHERE id >= ? ORDER BY id LIMIT ?",
+                (start_id, limit),
+            )
+        for row in cursor:
+            yield int(row[0]), str(row[1])
+
+    def iter_comics_before_id(self, before_id: int, *, limit: int) -> Iterable[tuple[int, str]]:
+        cursor = self._conn.execute(
+            "SELECT id, json FROM comics WHERE id < ? ORDER BY id LIMIT ?",
+            (before_id, limit),
+        )
+        for row in cursor:
+            yield int(row[0]), str(row[1])
+
     def update_comic_json(self, comic_id: int, json_text: str) -> None:
         self._conn.execute(
             "UPDATE comics SET json = ? WHERE id = ?",
             (json_text, comic_id),
         )
+
+    def get_min_comic_id(self) -> int | None:
+        row = self._conn.execute("SELECT MIN(id) FROM comics").fetchone()
+        if row is None:
+            return None
+        value = row[0]
+        if value is None:
+            return None
+        return int(value)
 
     def get_max_comic_id(self) -> int | None:
         row = self._conn.execute("SELECT MAX(id) FROM comics").fetchone()
@@ -171,6 +220,27 @@ class SqliteStore:
                 sleep_seconds = DB_LOCK_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
                 sleep_seconds += random.uniform(0.0, 0.05)
                 time.sleep(sleep_seconds)
+
+    def _execute_best_effort(self, sql: str) -> None:
+        try:
+            for attempt in range(1, DB_LOCK_RETRY_MAX_ATTEMPTS + 1):
+                try:
+                    cursor = self._conn.execute(sql)
+                    try:
+                        cursor.fetchall()
+                    except sqlite3.ProgrammingError:
+                        pass
+                    return
+                except sqlite3.OperationalError as exc:
+                    if not _is_db_lock_error(exc):
+                        raise
+                    if attempt >= DB_LOCK_RETRY_MAX_ATTEMPTS:
+                        raise
+                    sleep_seconds = DB_LOCK_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                    sleep_seconds += random.uniform(0.0, 0.05)
+                    time.sleep(sleep_seconds)
+        except Exception:
+            return
 
     def _wal_checkpoint_truncate_best_effort(self) -> None:
         try:
