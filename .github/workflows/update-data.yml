@@ -65,3 +65,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload data data/zaimanhua.sqlite3 --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Build pages
+        if: steps.db_changed.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/zhongfly/zmh-search/actions/workflows/pages-deploy.yml/dispatches \
+            -d '{"ref":"main"}'
