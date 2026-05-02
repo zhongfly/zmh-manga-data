@@ -86,7 +86,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          curl -sS -X POST \
+          curl --fail-with-body -sS -X POST \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/zhongfly/zmh-search/actions/workflows/pages-deploy.yml/dispatches \
@@ -101,7 +101,7 @@ jobs:
 
       - name: Upload DB artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zaimanhua-db
           path: |
