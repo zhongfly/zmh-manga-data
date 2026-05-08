@@ -48,7 +48,7 @@ jobs:
 
       - name: Run updater
         run: |
-          python main.py --db data/zaimanhua.sqlite3
+          python main.py --db data/zaimanhua.sqlite3 || true
 
       - name: Check if DB changed
         id: db_changed
