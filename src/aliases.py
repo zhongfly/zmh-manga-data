@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
 
@@ -47,7 +48,12 @@ def fetch_aliases(*, session: requests.Session, comic_id: int, timeout_seconds: 
             )
 
         keywords_content = _extract_keywords_content_streaming(resp)
-        aliases = _parse_aliases_from_keywords(keywords_content)
+        try:
+            aliases = _parse_aliases_from_keywords(keywords_content)
+        except FetchError as exc:
+            if exc.response_text is not None:
+                raise
+            raise FetchError(str(exc), response_text=_truncate_text(keywords_content)) from exc
         return AliasResult(aliases=aliases)
 
 
@@ -84,25 +90,87 @@ def _extract_keywords_content(html: str) -> str:
 
 
 def _extract_keywords_content_streaming(resp: requests.Response) -> str:
-    encoding = resp.encoding or "utf-8"
-    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
-    parser = _KeywordsMetaParser()
-
+    fallback_encoding = resp.encoding or "utf-8"
     bytes_read = 0
+    buffered = bytearray()
     for chunk in resp.iter_content(chunk_size=ALIASES_SCAN_CHUNK_SIZE):
         if not chunk:
             continue
         bytes_read += len(chunk)
-        parser.feed(decoder.decode(chunk))
-        if parser.keywords_content:
-            return parser.keywords_content
+        buffered.extend(chunk)
+        keywords_content = _extract_keywords_content_from_bytes(
+            bytes(buffered),
+            fallback_encoding=fallback_encoding,
+        )
+        if keywords_content:
+            return keywords_content
         if bytes_read >= ALIASES_SCAN_LIMIT_BYTES:
             break
 
-    parser.feed(decoder.decode(b"", final=True))
-    if parser.keywords_content:
-        return parser.keywords_content
+    keywords_content = _extract_keywords_content_from_bytes(
+        bytes(buffered),
+        fallback_encoding=fallback_encoding,
+    )
+    if keywords_content:
+        return keywords_content
     raise FetchError(f"别名页面未在前 {ALIASES_SCAN_LIMIT_BYTES} 字节内找到 meta[name=keywords]")
+
+
+_CHARSET_RE = re.compile(
+    rb"""<meta\b[^>]*\bcharset\s*=\s*["']?\s*([A-Za-z0-9._:-]+)""",
+    re.IGNORECASE,
+)
+
+
+def _extract_keywords_content_from_bytes(data: bytes, *, fallback_encoding: str) -> str | None:
+    if not data:
+        return None
+
+    encoding = _detect_html_encoding(data, fallback_encoding=fallback_encoding)
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    html = decoder.decode(data, final=True)
+    parser = _KeywordsMetaParser()
+    try:
+        parser.feed(html)
+    except Exception as exc:
+        raise FetchError(f"别名页面解析失败: {exc!r}") from exc
+    return parser.keywords_content
+
+
+def _detect_html_encoding(data: bytes, *, fallback_encoding: str) -> str:
+    if data.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+
+    match = _CHARSET_RE.search(data)
+    if match:
+        try:
+            encoding = match.group(1).decode("ascii")
+        except UnicodeDecodeError:
+            pass
+        else:
+            return _require_supported_encoding(
+                encoding,
+                source="HTML charset",
+                data=data,
+            )
+
+    return _require_supported_encoding(
+        fallback_encoding or "utf-8",
+        source="响应编码",
+        data=data,
+    )
+
+
+def _require_supported_encoding(encoding: str, *, source: str, data: bytes) -> str:
+    try:
+        codecs.lookup(encoding)
+    except LookupError as exc:
+        response_text = data[:ALIASES_SCAN_LIMIT_BYTES].decode("ascii", errors="replace")
+        raise FetchError(
+            f"别名页面{source}无法识别: {encoding}",
+            response_text=_truncate_text(response_text),
+        ) from exc
+    return encoding
 
 
 def _parse_aliases_from_keywords(content: str) -> list[str]:
@@ -199,3 +267,9 @@ def _safe_text(resp: requests.Response, limit: int = 20_000) -> str:
     if len(text) > limit:
         return text[:limit] + f"... <truncated {len(text) - limit} chars>"
     return text
+
+
+def _truncate_text(text: str, limit: int = 20_000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... <truncated {len(text) - limit} chars>"
