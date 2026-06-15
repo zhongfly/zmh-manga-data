@@ -347,7 +347,7 @@ def _parse_args(argv: list[str] | None) -> SyncConfig:
     )
     parser.add_argument(
         "--no-auto-update-history",
-        action="store_true",
+        action="store_false",
         help="启动时跳过自动更新历史数据（默认启用）",
     )
     parser.add_argument(
