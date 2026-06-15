@@ -180,7 +180,7 @@ def _parse_aliases_from_keywords(content: str) -> list[str]:
 
     title = _extract_title_from_keywords(content)
     if not title:
-        raise FetchError("keywords 中无法解析标题")
+        raise FetchError(f"keywords 中无法解析标题，{content}")
     content = _drop_first_keywords_by_title(content, title=title, count=3)
 
     parts = _split_keywords(content)
